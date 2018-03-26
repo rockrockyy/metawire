@@ -6,6 +6,7 @@ package metawire
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/binary"
@@ -47,7 +48,7 @@ type Wire struct {
 	utMetadata   int
 	numOfPieces  int
 	pieces       [][]byte
-	ticker       *time.Ticker
+	err          error
 }
 
 type option func(w *Wire)
@@ -70,7 +71,6 @@ func New(infohash string, from string, options ...option) *Wire {
 		peerID:   randomPeerID(),
 		timeout:  5 * time.Second,
 	}
-	w.ticker = time.NewTicker(w.timeout)
 	for _, option := range options {
 		option(w)
 	}
@@ -78,42 +78,46 @@ func New(infohash string, from string, options ...option) *Wire {
 }
 
 func (w *Wire) Fetch() ([]byte, error) {
-	defer w.ticker.Stop()
-	return w.fetch()
+	ctx, cancel := context.WithTimeout(context.Background(), w.timeout)
+	defer cancel()
+	return w.fetch(ctx)
 }
 
-func (w *Wire) connect() error {
+func (w *Wire) connect(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		w.err = ErrExtHeader
+		return
+	default:
+	}
 	conn, err := net.DialTimeout("tcp", w.from, w.timeout)
 	if err != nil {
-		return fmt.Errorf("metawire: connect to remote peer failed: %v", err)
+		w.err = fmt.Errorf("metawire: connect to remote peer failed: %v", err)
+		return
 	}
 	w.conn = conn.(*net.TCPConn)
-	return nil
 }
 
-func (w *Wire) fetch() ([]byte, error) {
-	if err := w.connect(); err != nil {
-		return nil, err
-	}
-	defer w.conn.Close()
-	if err := w.handshake(); err != nil {
-		return nil, err
-	}
-	if err := w.onHandshake(); err != nil {
-		return nil, err
-	}
-	if err := w.extHandshake(); err != nil {
-		return nil, err
+func (w *Wire) fetch(ctx context.Context) ([]byte, error) {
+	w.connect(ctx)
+	w.handshake(ctx)
+	w.onHandshake(ctx)
+	w.extHandshake(ctx)
+	if w.err != nil {
+		if w.conn != nil {
+			w.conn.Close()
+		}
+		return nil, w.err
 	}
 	for {
-		data, err := w.next()
+		data, err := w.next(ctx)
 		if err != nil {
 			return nil, err
 		}
 		if data[0] != extended {
 			continue
 		}
-		if err := w.onExtended(data[1], data[2:]); err != nil {
+		if err := w.onExtended(ctx, data[1], data[2:]); err != nil {
 			return nil, err
 		}
 		if !w.checkDone() {
@@ -128,41 +132,60 @@ func (w *Wire) fetch() ([]byte, error) {
 	}
 }
 
-func (w *Wire) handshake() error {
+func (w *Wire) handshake(ctx context.Context) {
+	if w.err != nil {
+		return
+	}
 	select {
-	case <-w.ticker.C:
-		return ErrTimeout
+	case <-ctx.Done():
+		w.err = ErrTimeout
+		return
 	default:
 	}
 	buf := bytes.NewBuffer(nil)
 	buf.Write(w.preHeader())
 	buf.WriteString(w.infohash)
 	buf.WriteString(w.peerID)
-	_, err := w.conn.Write(buf.Bytes())
-	return err
+	_, w.err = w.conn.Write(buf.Bytes())
 }
 
-func (w *Wire) onHandshake() error {
-	res, err := w.read(68)
+func (w *Wire) onHandshake(ctx context.Context) {
+	if w.err != nil {
+		return
+	}
+	select {
+	case <-ctx.Done():
+		w.err = ErrTimeout
+		return
+	default:
+	}
+	res, err := w.read(ctx, 68)
 	if err != nil {
-		return err
+		w.err = err
+		return
 	}
 	if !bytes.Equal(res[:20], w.preHeader()[:20]) {
-		return errors.New("metawire: remote peer not supporting bittorrent protocol")
+		w.err = errors.New("metawire: remote peer not supporting bittorrent protocol")
+		return
 	}
 	if res[25]&0x10 != 0x10 {
-		return errors.New("metawire: remote peer not supporting extention protocol")
+		w.err = errors.New("metawire: remote peer not supporting extention protocol")
+		return
 	}
 	if !bytes.Equal(res[28:48], []byte(w.infohash)) {
-		return errors.New("metawire: invalid bittorrent header response")
+		w.err = errors.New("metawire: invalid bittorrent header response")
+		return
 	}
-	return nil
 }
 
-func (w *Wire) extHandshake() error {
+func (w *Wire) extHandshake(ctx context.Context) {
+	if w.err != nil {
+		return
+	}
 	select {
-	case <-w.ticker.C:
-		return ErrTimeout
+	case <-ctx.Done():
+		w.err = ErrTimeout
+		return
 	default:
 	}
 	data := append([]byte{extended, extHandshake}, bencode.Encode(map[string]interface{}{
@@ -170,15 +193,15 @@ func (w *Wire) extHandshake() error {
 			"ut_metadata": 1,
 		},
 	})...)
-	if err := w.send(data); err != nil {
-		return err
+	if err := w.send(ctx, data); err != nil {
+		w.err = err
+		return
 	}
-	return nil
 }
 
-func (w *Wire) onExtHandshake(payload []byte) error {
+func (w *Wire) onExtHandshake(ctx context.Context, payload []byte) error {
 	select {
-	case <-w.ticker.C:
+	case <-ctx.Done():
 		return ErrTimeout
 	default:
 	}
@@ -212,12 +235,12 @@ func (w *Wire) onExtHandshake(payload []byte) error {
 	}
 	w.pieces = make([][]byte, w.numOfPieces)
 	for i := 0; i < w.numOfPieces; i++ {
-		w.requestPiece(i)
+		w.requestPiece(ctx, i)
 	}
 	return nil
 }
 
-func (w *Wire) requestPiece(i int) {
+func (w *Wire) requestPiece(ctx context.Context, i int) {
 	buf := bytes.NewBuffer(nil)
 	buf.WriteByte(byte(extended))
 	buf.WriteByte(byte(w.utMetadata))
@@ -225,16 +248,16 @@ func (w *Wire) requestPiece(i int) {
 		"msg_type": 0,
 		"piece":    i,
 	}))
-	w.send(buf.Bytes())
+	w.send(ctx, buf.Bytes())
 }
 
-func (w *Wire) onExtended(ext byte, payload []byte) error {
+func (w *Wire) onExtended(ctx context.Context, ext byte, payload []byte) error {
 	if ext == 0 {
-		if err := w.onExtHandshake(payload); err != nil {
+		if err := w.onExtHandshake(ctx, payload); err != nil {
 			return err
 		}
 	} else {
-		piece, index, err := w.onPiece(payload)
+		piece, index, err := w.onPiece(ctx, payload)
 		if err != nil {
 			return err
 		}
@@ -243,9 +266,9 @@ func (w *Wire) onExtended(ext byte, payload []byte) error {
 	return nil
 }
 
-func (w *Wire) onPiece(payload []byte) ([]byte, int, error) {
+func (w *Wire) onPiece(ctx context.Context, payload []byte) ([]byte, int, error) {
 	select {
-	case <-w.ticker.C:
+	case <-ctx.Done():
 		return nil, -1, ErrTimeout
 	default:
 	}
@@ -285,22 +308,22 @@ func (w *Wire) preHeader() []byte {
 	return buf.Bytes()
 }
 
-func (w *Wire) next() ([]byte, error) {
-	data, err := w.read(4)
+func (w *Wire) next(ctx context.Context) ([]byte, error) {
+	data, err := w.read(ctx, 4)
 	if err != nil {
 		return nil, err
 	}
 	size := binary.BigEndian.Uint32(data)
-	data, err = w.read(size)
+	data, err = w.read(ctx, size)
 	if err != nil {
 		return nil, err
 	}
 	return data, nil
 }
 
-func (w *Wire) read(size uint32) ([]byte, error) {
+func (w *Wire) read(ctx context.Context, size uint32) ([]byte, error) {
 	select {
-	case <-w.ticker.C:
+	case <-ctx.Done():
 		return nil, ErrTimeout
 	default:
 	}
@@ -312,9 +335,9 @@ func (w *Wire) read(size uint32) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func (w *Wire) send(data []byte) error {
+func (w *Wire) send(ctx context.Context, data []byte) error {
 	select {
-	case <-w.ticker.C:
+	case <-ctx.Done():
 		return ErrTimeout
 	default:
 	}
